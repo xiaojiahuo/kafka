@@ -21,17 +21,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue}
 import java.util.concurrent.locks.ReentrantLock
 
-import com.yammer.metrics.core.Gauge
 import kafka.metrics.{KafkaMetricsGroup, KafkaTimer}
 import kafka.utils.CoreUtils.inLock
 import kafka.utils.ShutdownableThread
 import org.apache.kafka.common.utils.Time
 
 import scala.collection._
-import scala.collection.JavaConverters._
 
 object ControllerEventManager {
   val ControllerEventThreadName = "controller-event-thread"
+  val EventQueueTimeMetricName = "EventQueueTimeMs"
+  val EventQueueSizeMetricName = "EventQueueSize"
 }
 
 trait ControllerEventProcessor {
@@ -70,32 +70,31 @@ class ControllerEventManager(controllerId: Int,
                              processor: ControllerEventProcessor,
                              time: Time,
                              rateAndTimeMetrics: Map[ControllerState, KafkaTimer]) extends KafkaMetricsGroup {
+  import ControllerEventManager._
 
   @volatile private var _state: ControllerState = ControllerState.Idle
   private val putLock = new ReentrantLock()
   private val queue = new LinkedBlockingQueue[QueuedEvent]
   // Visible for test
-  private[controller] val thread = new ControllerEventThread(ControllerEventManager.ControllerEventThreadName)
+  private[controller] val thread = new ControllerEventThread(ControllerEventThreadName)
 
-  private val eventQueueTimeHist = newHistogram("EventQueueTimeMs")
+  private val eventQueueTimeHist = newHistogram(EventQueueTimeMetricName)
 
-  newGauge(
-    "EventQueueSize",
-    new Gauge[Int] {
-      def value: Int = {
-        queue.size()
-      }
-    }
-  )
+  newGauge(EventQueueSizeMetricName, () => queue.size)
 
   def state: ControllerState = _state
 
   def start(): Unit = thread.start()
 
   def close(): Unit = {
-    thread.initiateShutdown()
-    clearAndPut(ShutdownEventThread)
-    thread.awaitShutdown()
+    try {
+      thread.initiateShutdown()
+      clearAndPut(ShutdownEventThread)
+      thread.awaitShutdown()
+    } finally {
+      removeMetric(EventQueueTimeMetricName)
+      removeMetric(EventQueueSizeMetricName)
+    }
   }
 
   def put(event: ControllerEvent): QueuedEvent = inLock(putLock) {
@@ -105,7 +104,7 @@ class ControllerEventManager(controllerId: Int,
   }
 
   def clearAndPut(event: ControllerEvent): QueuedEvent = inLock(putLock) {
-    queue.asScala.foreach(_.preempt(processor))
+    queue.forEach(_.preempt(processor))
     queue.clear()
     put(event)
   }
@@ -125,8 +124,11 @@ class ControllerEventManager(controllerId: Int,
           eventQueueTimeHist.update(time.milliseconds() - dequeued.enqueueTimeMs)
 
           try {
-            rateAndTimeMetrics(state).time {
-              dequeued.process(processor)
+            def process(): Unit = dequeued.process(processor)
+
+            rateAndTimeMetrics.get(state) match {
+              case Some(timer) => timer.time { process() }
+              case None => process()
             }
           } catch {
             case e: Throwable => error(s"Uncaught error processing event $controllerEvent", e)

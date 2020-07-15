@@ -25,6 +25,8 @@ import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.BytesSerializer;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.kstream.internals.Change;
+import org.apache.kafka.streams.kstream.internals.FullChangeSerde;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.processor.internals.InternalProcessorContext;
@@ -32,73 +34,90 @@ import org.apache.kafka.streams.processor.internals.ProcessorRecordContext;
 import org.apache.kafka.streams.processor.internals.ProcessorStateManager;
 import org.apache.kafka.streams.processor.internals.RecordBatchingStateRestoreCallback;
 import org.apache.kafka.streams.processor.internals.RecordCollector;
+import org.apache.kafka.streams.processor.internals.RecordQueue;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
 import org.apache.kafka.streams.state.StoreBuilder;
-import org.apache.kafka.streams.state.internals.metrics.Sensors;
+import org.apache.kafka.streams.state.ValueAndTimestamp;
+import org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBufferChangelogDeserializationHelper.DeserializationResult;
+import org.apache.kafka.streams.state.internals.metrics.StateStoreMetrics;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Objects;
+import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import static java.util.Objects.requireNonNull;
+import static org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBufferChangelogDeserializationHelper.deserializeV0;
+import static org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBufferChangelogDeserializationHelper.deserializeV1;
+import static org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBufferChangelogDeserializationHelper.deserializeV3;
+import static org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBufferChangelogDeserializationHelper.duckTypeV2;
 
 public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrderedKeyValueBuffer<K, V> {
     private static final BytesSerializer KEY_SERIALIZER = new BytesSerializer();
     private static final ByteArraySerializer VALUE_SERIALIZER = new ByteArraySerializer();
-    private static final RecordHeaders V_1_CHANGELOG_HEADERS =
-        new RecordHeaders(new Header[] {new RecordHeader("v", new byte[] {(byte) 1})});
+    private static final byte[] V_1_CHANGELOG_HEADER_VALUE = {(byte) 1};
+    private static final byte[] V_2_CHANGELOG_HEADER_VALUE = {(byte) 2};
+    private static final byte[] V_3_CHANGELOG_HEADER_VALUE = {(byte) 3};
+    static final RecordHeaders CHANGELOG_HEADERS =
+        new RecordHeaders(new Header[] {new RecordHeader("v", V_3_CHANGELOG_HEADER_VALUE)});
+    private static final String METRIC_SCOPE = "in-memory-suppression";
 
     private final Map<Bytes, BufferKey> index = new HashMap<>();
-    private final TreeMap<BufferKey, ContextualRecord> sortedMap = new TreeMap<>();
+    private final TreeMap<BufferKey, BufferValue> sortedMap = new TreeMap<>();
 
     private final Set<Bytes> dirtyKeys = new HashSet<>();
     private final String storeName;
     private final boolean loggingEnabled;
 
     private Serde<K> keySerde;
-    private Serde<V> valueSerde;
+    private FullChangeSerde<V> valueSerde;
 
     private long memBufferSize = 0L;
     private long minTimestamp = Long.MAX_VALUE;
-    private RecordCollector collector;
+    private InternalProcessorContext context;
     private String changelogTopic;
     private Sensor bufferSizeSensor;
     private Sensor bufferCountSensor;
+    private StreamsMetricsImpl streamsMetrics;
+    private String threadId;
+    private String taskId;
 
     private volatile boolean open;
 
     private int partition;
 
-    public static class Builder<K, V> implements StoreBuilder<StateStore> {
+    public static class Builder<K, V> implements StoreBuilder<InMemoryTimeOrderedKeyValueBuffer<K, V>> {
 
         private final String storeName;
         private final Serde<K> keySerde;
-        private final Serde<V> valSerde;
+        private final Serde<V> valueSerde;
         private boolean loggingEnabled = true;
+        private Map<String, String> logConfig = new HashMap<>();
 
-        public Builder(final String storeName, final Serde<K> keySerde, final Serde<V> valSerde) {
+        public Builder(final String storeName, final Serde<K> keySerde, final Serde<V> valueSerde) {
             this.storeName = storeName;
             this.keySerde = keySerde;
-            this.valSerde = valSerde;
+            this.valueSerde = valueSerde;
         }
 
         /**
          * As of 2.1, there's no way for users to directly interact with the buffer,
          * so this method is implemented solely to be called by Streams (which
          * it will do based on the {@code cache.max.bytes.buffering} config.
-         *
+         * <p>
          * It's currently a no-op.
          */
         @Override
-        public StoreBuilder<StateStore> withCachingEnabled() {
+        public StoreBuilder<InMemoryTimeOrderedKeyValueBuffer<K, V>> withCachingEnabled() {
             return this;
         }
 
@@ -106,33 +125,34 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
          * As of 2.1, there's no way for users to directly interact with the buffer,
          * so this method is implemented solely to be called by Streams (which
          * it will do based on the {@code cache.max.bytes.buffering} config.
-         *
+         * <p>
          * It's currently a no-op.
          */
         @Override
-        public StoreBuilder<StateStore> withCachingDisabled() {
+        public StoreBuilder<InMemoryTimeOrderedKeyValueBuffer<K, V>> withCachingDisabled() {
             return this;
         }
 
         @Override
-        public StoreBuilder<StateStore> withLoggingEnabled(final Map<String, String> config) {
-            throw new UnsupportedOperationException();
+        public StoreBuilder<InMemoryTimeOrderedKeyValueBuffer<K, V>> withLoggingEnabled(final Map<String, String> config) {
+            logConfig = config;
+            return this;
         }
 
         @Override
-        public StoreBuilder<StateStore> withLoggingDisabled() {
+        public StoreBuilder<InMemoryTimeOrderedKeyValueBuffer<K, V>> withLoggingDisabled() {
             loggingEnabled = false;
             return this;
         }
 
         @Override
         public InMemoryTimeOrderedKeyValueBuffer<K, V> build() {
-            return new InMemoryTimeOrderedKeyValueBuffer<>(storeName, loggingEnabled, keySerde, valSerde);
+            return new InMemoryTimeOrderedKeyValueBuffer<>(storeName, loggingEnabled, keySerde, valueSerde);
         }
 
         @Override
         public Map<String, String> logConfig() {
-            return Collections.emptyMap();
+            return loggingEnabled() ? Collections.unmodifiableMap(logConfig) : Collections.emptyMap();
         }
 
         @Override
@@ -146,49 +166,6 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
         }
     }
 
-    private static final class BufferKey implements Comparable<BufferKey> {
-        private final long time;
-        private final Bytes key;
-
-        private BufferKey(final long time, final Bytes key) {
-            this.time = time;
-            this.key = key;
-        }
-
-        @Override
-        public boolean equals(final Object o) {
-            if (this == o) {
-                return true;
-            }
-            if (o == null || getClass() != o.getClass()) {
-                return false;
-            }
-            final BufferKey bufferKey = (BufferKey) o;
-            return time == bufferKey.time &&
-                Objects.equals(key, bufferKey.key);
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(time, key);
-        }
-
-        @Override
-        public int compareTo(final BufferKey o) {
-            // ordering of keys within a time uses hashCode.
-            final int timeComparison = Long.compare(time, o.time);
-            return timeComparison == 0 ? key.compareTo(o.key) : timeComparison;
-        }
-
-        @Override
-        public String toString() {
-            return "BufferKey{" +
-                "key=" + key +
-                ", time=" + time +
-                '}';
-        }
-    }
-
     private InMemoryTimeOrderedKeyValueBuffer(final String storeName,
                                               final boolean loggingEnabled,
                                               final Serde<K> keySerde,
@@ -196,7 +173,7 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
         this.storeName = storeName;
         this.loggingEnabled = loggingEnabled;
         this.keySerde = keySerde;
-        this.valueSerde = valueSerde;
+        this.valueSerde = FullChangeSerde.wrap(valueSerde);
     }
 
     @Override
@@ -213,21 +190,33 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
     @Override
     public void setSerdesIfNull(final Serde<K> keySerde, final Serde<V> valueSerde) {
         this.keySerde = this.keySerde == null ? keySerde : this.keySerde;
-        this.valueSerde = this.valueSerde == null ? valueSerde : this.valueSerde;
+        this.valueSerde = this.valueSerde == null ? FullChangeSerde.wrap(valueSerde) : this.valueSerde;
     }
 
     @Override
     public void init(final ProcessorContext context, final StateStore root) {
-        final InternalProcessorContext internalProcessorContext = (InternalProcessorContext) context;
+        taskId = context.taskId().toString();
+        this.context = (InternalProcessorContext) context;
+        streamsMetrics = this.context.metrics();
 
-        bufferSizeSensor = Sensors.createBufferSizeSensor(this, internalProcessorContext);
-        bufferCountSensor = Sensors.createBufferCountSensor(this, internalProcessorContext);
+        threadId = Thread.currentThread().getName();
+        bufferSizeSensor = StateStoreMetrics.suppressionBufferSizeSensor(
+            threadId,
+            taskId,
+            METRIC_SCOPE,
+            storeName,
+            streamsMetrics
+        );
+        bufferCountSensor = StateStoreMetrics.suppressionBufferCountSensor(
+            threadId,
+            taskId,
+            METRIC_SCOPE,
+            storeName,
+            streamsMetrics
+        );
 
         context.register(root, (RecordBatchingStateRestoreCallback) this::restoreBatch);
-        if (loggingEnabled) {
-            collector = ((RecordCollector.Supplier) context).recordCollector();
-            changelogTopic = ProcessorStateManager.storeChangelogTopic(context.applicationId(), storeName);
-        }
+        changelogTopic = ProcessorStateManager.storeChangelogTopic(context.applicationId(), storeName);
         updateBufferMetrics();
         open = true;
         partition = context.taskId().partition;
@@ -247,6 +236,7 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
         memBufferSize = 0;
         minTimestamp = Long.MAX_VALUE;
         updateBufferMetrics();
+        streamsMetrics.removeAllStoreLevelSensors(threadId, taskId, storeName);
     }
 
     @Override
@@ -261,7 +251,7 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
                     // The record was evicted from the buffer. Send a tombstone.
                     logTombstone(key);
                 } else {
-                    final ContextualRecord value = sortedMap.get(bufferKey);
+                    final BufferValue value = sortedMap.get(bufferKey);
 
                     logValue(key, bufferKey, value);
                 }
@@ -270,22 +260,17 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
         }
     }
 
-    private void logValue(final Bytes key, final BufferKey bufferKey, final ContextualRecord value) {
-        final byte[] serializedContextualRecord = value.serialize();
+    private void logValue(final Bytes key, final BufferKey bufferKey, final BufferValue value) {
 
         final int sizeOfBufferTime = Long.BYTES;
-        final int sizeOfContextualRecord = serializedContextualRecord.length;
-
-        final byte[] timeAndContextualRecord = ByteBuffer.wrap(new byte[sizeOfBufferTime + sizeOfContextualRecord])
-                                                         .putLong(bufferKey.time)
-                                                         .put(serializedContextualRecord)
-                                                         .array();
-
-        collector.send(
+        final ByteBuffer buffer = value.serialize(sizeOfBufferTime);
+        buffer.putLong(bufferKey.time());
+        final byte[] array = buffer.array();
+        ((RecordCollector.Supplier) context).recordCollector().send(
             changelogTopic,
             key,
-            timeAndContextualRecord,
-            V_1_CHANGELOG_HEADERS,
+            array,
+            CHANGELOG_HEADERS,
             partition,
             null,
             KEY_SERIALIZER,
@@ -294,74 +279,20 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
     }
 
     private void logTombstone(final Bytes key) {
-        collector.send(changelogTopic,
-                       key,
-                       null,
-                       null,
-                       partition,
-                       null,
-                       KEY_SERIALIZER,
-                       VALUE_SERIALIZER
+        ((RecordCollector.Supplier) context).recordCollector().send(
+            changelogTopic,
+            key,
+            null,
+            null,
+            partition,
+            null,
+            KEY_SERIALIZER,
+            VALUE_SERIALIZER
         );
     }
 
     private void restoreBatch(final Collection<ConsumerRecord<byte[], byte[]>> batch) {
         for (final ConsumerRecord<byte[], byte[]> record : batch) {
-            final Bytes key = Bytes.wrap(record.key());
-            if (record.value() == null) {
-                // This was a tombstone. Delete the record.
-                final BufferKey bufferKey = index.remove(key);
-                if (bufferKey != null) {
-                    final ContextualRecord removed = sortedMap.remove(bufferKey);
-                    if (removed != null) {
-                        memBufferSize -= computeRecordSize(bufferKey.key, removed);
-                    }
-                    if (bufferKey.time == minTimestamp) {
-                        minTimestamp = sortedMap.isEmpty() ? Long.MAX_VALUE : sortedMap.firstKey().time;
-                    }
-                }
-
-                if (record.partition() != partition) {
-                    throw new IllegalStateException(
-                        String.format(
-                            "record partition [%d] is being restored by the wrong suppress partition [%d]",
-                            record.partition(),
-                            partition
-                        )
-                    );
-                }
-            } else {
-                final ByteBuffer timeAndValue = ByteBuffer.wrap(record.value());
-                final long time = timeAndValue.getLong();
-                final byte[] value = new byte[record.value().length - 8];
-                timeAndValue.get(value);
-                if (record.headers().lastHeader("v") == null) {
-                    cleanPut(
-                        time,
-                        key,
-                        new ContextualRecord(
-                            value,
-                            new ProcessorRecordContext(
-                                record.timestamp(),
-                                record.offset(),
-                                record.partition(),
-                                record.topic(),
-                                record.headers()
-                            )
-                        )
-                    );
-                } else if (V_1_CHANGELOG_HEADERS.lastHeader("v").equals(record.headers().lastHeader("v"))) {
-                    final ContextualRecord contextualRecord = ContextualRecord.deserialize(ByteBuffer.wrap(value));
-
-                    cleanPut(
-                        time,
-                        key,
-                        contextualRecord
-                    );
-                } else {
-                    throw new IllegalArgumentException("Restoring apparently invalid changelog record: " + record);
-                }
-            }
             if (record.partition() != partition) {
                 throw new IllegalStateException(
                     String.format(
@@ -371,6 +302,71 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
                     )
                 );
             }
+            final Bytes key = Bytes.wrap(record.key());
+            if (record.value() == null) {
+                // This was a tombstone. Delete the record.
+                final BufferKey bufferKey = index.remove(key);
+                if (bufferKey != null) {
+                    final BufferValue removed = sortedMap.remove(bufferKey);
+                    if (removed != null) {
+                        memBufferSize -= computeRecordSize(bufferKey.key(), removed);
+                    }
+                    if (bufferKey.time() == minTimestamp) {
+                        minTimestamp = sortedMap.isEmpty() ? Long.MAX_VALUE : sortedMap.firstKey().time();
+                    }
+                }
+            } else {
+                final Header versionHeader = record.headers().lastHeader("v");
+                if (versionHeader == null) {
+                    // Version 0:
+                    // value:
+                    //  - buffer time
+                    //  - old value
+                    //  - new value
+                    final byte[] previousBufferedValue = index.containsKey(key)
+                        ? internalPriorValueForBuffered(key)
+                        : null;
+                    final DeserializationResult deserializationResult = deserializeV0(record, key, previousBufferedValue);
+                    cleanPut(deserializationResult.time(), deserializationResult.key(), deserializationResult.bufferValue());
+                } else if (Arrays.equals(versionHeader.value(), V_3_CHANGELOG_HEADER_VALUE)) {
+                    // Version 3:
+                    // value:
+                    //  - record context
+                    //  - prior value
+                    //  - old value
+                    //  - new value
+                    //  - buffer time
+                    final DeserializationResult deserializationResult = deserializeV3(record, key);
+                    cleanPut(deserializationResult.time(), deserializationResult.key(), deserializationResult.bufferValue());
+
+                } else if (Arrays.equals(versionHeader.value(), V_2_CHANGELOG_HEADER_VALUE)) {
+                    // Version 2:
+                    // value:
+                    //  - record context
+                    //  - old value
+                    //  - new value
+                    //  - prior value
+                    //  - buffer time
+                    // NOTE: 2.4.0, 2.4.1, and 2.5.0 actually encode Version 3 formatted data,
+                    // but still set the Version 2 flag, so to deserialize, we have to duck type.
+                    final DeserializationResult deserializationResult = duckTypeV2(record, key);
+                    cleanPut(deserializationResult.time(), deserializationResult.key(), deserializationResult.bufferValue());
+                } else if (Arrays.equals(versionHeader.value(), V_1_CHANGELOG_HEADER_VALUE)) {
+                    // Version 1:
+                    // value:
+                    //  - buffer time
+                    //  - record context
+                    //  - old value
+                    //  - new value
+                    final byte[] previousBufferedValue = index.containsKey(key)
+                        ? internalPriorValueForBuffered(key)
+                        : null;
+                    final DeserializationResult deserializationResult = deserializeV1(record, key, previousBufferedValue);
+                    cleanPut(deserializationResult.time(), deserializationResult.key(), deserializationResult.bufferValue());
+                } else {
+                    throw new IllegalArgumentException("Restoring apparently invalid changelog record: " + record);
+                }
+            }
         }
         updateBufferMetrics();
     }
@@ -379,38 +375,42 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
     @Override
     public void evictWhile(final Supplier<Boolean> predicate,
                            final Consumer<Eviction<K, V>> callback) {
-        final Iterator<Map.Entry<BufferKey, ContextualRecord>> delegate = sortedMap.entrySet().iterator();
+        final Iterator<Map.Entry<BufferKey, BufferValue>> delegate = sortedMap.entrySet().iterator();
         int evictions = 0;
 
         if (predicate.get()) {
-            Map.Entry<BufferKey, ContextualRecord> next = null;
+            Map.Entry<BufferKey, BufferValue> next = null;
             if (delegate.hasNext()) {
                 next = delegate.next();
             }
 
             // predicate being true means we read one record, call the callback, and then remove it
             while (next != null && predicate.get()) {
-                if (next.getKey().time != minTimestamp) {
+                if (next.getKey().time() != minTimestamp) {
                     throw new IllegalStateException(
                         "minTimestamp [" + minTimestamp + "] did not match the actual min timestamp [" +
-                            next.getKey().time + "]"
+                            next.getKey().time() + "]"
                     );
                 }
-                final K key = keySerde.deserializer().deserialize(changelogTopic, next.getKey().key.get());
-                final V value = valueSerde.deserializer().deserialize(changelogTopic, next.getValue().value());
-                callback.accept(new Eviction<>(key, value, next.getValue().recordContext()));
+                final K key = keySerde.deserializer().deserialize(changelogTopic, next.getKey().key().get());
+                final BufferValue bufferValue = next.getValue();
+                final Change<V> value = valueSerde.deserializeParts(
+                    changelogTopic,
+                    new Change<>(bufferValue.newValue(), bufferValue.oldValue())
+                );
+                callback.accept(new Eviction<>(key, value, bufferValue.context()));
 
                 delegate.remove();
-                index.remove(next.getKey().key);
+                index.remove(next.getKey().key());
 
-                dirtyKeys.add(next.getKey().key);
+                dirtyKeys.add(next.getKey().key());
 
-                memBufferSize -= computeRecordSize(next.getKey().key, next.getValue());
+                memBufferSize -= computeRecordSize(next.getKey().key(), bufferValue);
 
                 // peek at the next record so we can update the minTimestamp
                 if (delegate.hasNext()) {
                     next = delegate.next();
-                    minTimestamp = next == null ? Long.MAX_VALUE : next.getKey().time;
+                    minTimestamp = next == null ? Long.MAX_VALUE : next.getKey().time();
                 } else {
                     next = null;
                     minTimestamp = Long.MAX_VALUE;
@@ -425,22 +425,69 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
     }
 
     @Override
+    public Maybe<ValueAndTimestamp<V>> priorValueForBuffered(final K key) {
+        final Bytes serializedKey = Bytes.wrap(keySerde.serializer().serialize(changelogTopic, key));
+        if (index.containsKey(serializedKey)) {
+            final byte[] serializedValue = internalPriorValueForBuffered(serializedKey);
+
+            final V deserializedValue = valueSerde.innerSerde().deserializer().deserialize(
+                changelogTopic,
+                serializedValue
+            );
+
+            // it's unfortunately not possible to know this, unless we materialize the suppressed result, since our only
+            // knowledge of the prior value is what the upstream processor sends us as the "old value" when we first
+            // buffer something.
+            return Maybe.defined(ValueAndTimestamp.make(deserializedValue, RecordQueue.UNKNOWN));
+        } else {
+            return Maybe.undefined();
+        }
+    }
+
+    private byte[] internalPriorValueForBuffered(final Bytes key) {
+        final BufferKey bufferKey = index.get(key);
+        if (bufferKey == null) {
+            throw new NoSuchElementException("Key [" + key + "] is not in the buffer.");
+        } else {
+            final BufferValue bufferValue = sortedMap.get(bufferKey);
+            return bufferValue.priorValue();
+        }
+    }
+
+    @Override
     public void put(final long time,
                     final K key,
-                    final V value,
+                    final Change<V> value,
                     final ProcessorRecordContext recordContext) {
         requireNonNull(value, "value cannot be null");
         requireNonNull(recordContext, "recordContext cannot be null");
 
         final Bytes serializedKey = Bytes.wrap(keySerde.serializer().serialize(changelogTopic, key));
-        final byte[] serializedValue = valueSerde.serializer().serialize(changelogTopic, value);
+        final Change<byte[]> serialChange = valueSerde.serializeParts(changelogTopic, value);
 
-        cleanPut(time, serializedKey, new ContextualRecord(serializedValue, recordContext));
+        final BufferValue buffered = getBuffered(serializedKey);
+        final byte[] serializedPriorValue;
+        if (buffered == null) {
+            serializedPriorValue = serialChange.oldValue;
+        } else {
+            serializedPriorValue = buffered.priorValue();
+        }
+
+        cleanPut(
+            time,
+            serializedKey,
+            new BufferValue(serializedPriorValue, serialChange.oldValue, serialChange.newValue, recordContext)
+        );
         dirtyKeys.add(serializedKey);
         updateBufferMetrics();
     }
 
-    private void cleanPut(final long time, final Bytes key, final ContextualRecord value) {
+    private BufferValue getBuffered(final Bytes key) {
+        final BufferKey bufferKey = index.get(key);
+        return bufferKey == null ? null : sortedMap.get(bufferKey);
+    }
+
+    private void cleanPut(final long time, final Bytes key, final BufferValue value) {
         // non-resetting semantics:
         // if there was a previous version of the same record,
         // then insert the new record in the same place in the priority queue
@@ -453,7 +500,7 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
             minTimestamp = Math.min(minTimestamp, time);
             memBufferSize += computeRecordSize(key, value);
         } else {
-            final ContextualRecord removedValue = sortedMap.put(previousKey, value);
+            final BufferValue removedValue = sortedMap.put(previousKey, value);
             memBufferSize =
                 memBufferSize
                     + computeRecordSize(key, value)
@@ -476,19 +523,19 @@ public final class InMemoryTimeOrderedKeyValueBuffer<K, V> implements TimeOrdere
         return minTimestamp;
     }
 
-    private static long computeRecordSize(final Bytes key, final ContextualRecord value) {
+    private static long computeRecordSize(final Bytes key, final BufferValue value) {
         long size = 0L;
         size += 8; // buffer time
         size += key.get().length;
         if (value != null) {
-            size += value.sizeBytes();
+            size += value.residentMemorySizeEstimate();
         }
         return size;
     }
 
     private void updateBufferMetrics() {
-        bufferSizeSensor.record(memBufferSize);
-        bufferCountSensor.record(index.size());
+        bufferSizeSensor.record(memBufferSize, context.currentSystemTimeMs());
+        bufferCountSensor.record(index.size(), context.currentSystemTimeMs());
     }
 
     @Override

@@ -25,7 +25,7 @@ import kafka.server.{KafkaServer, KafkaServerStartable}
 import kafka.utils.{CommandLineUtils, Exit, Logging}
 import org.apache.kafka.common.utils.{Java, LoggingSignalHandler, OperatingSystem, Utils}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 object Kafka extends Logging {
 
@@ -38,7 +38,7 @@ object Kafka extends Logging {
     // fact that this class ignores the first parameter which is interpreted as positional and mandatory
     // but would not be mandatory if --version is specified
     // This is a bit of an ugly crutch till we get a chance to rework the entire command line parsing
-    val versionOpt = optionParser.accepts("version", "Print version information and exit.")
+    optionParser.accepts("version", "Print version information and exit.")
 
     if (args.length == 0 || args.contains("--help")) {
       CommandLineUtils.printUsageAndDie(optionParser, "USAGE: java [options] %s server.properties [--override property=value]*".format(classOf[KafkaServer].getSimpleName()))
@@ -77,9 +77,7 @@ object Kafka extends Logging {
       }
 
       // attach shutdown handler to catch terminating signals as well as normal termination
-      Runtime.getRuntime().addShutdownHook(new Thread("kafka-shutdown-hook") {
-        override def run(): Unit = kafkaServerStartable.shutdown()
-      })
+      Exit.addShutdownHook("kafka-shutdown-hook", kafkaServerStartable.shutdown())
 
       kafkaServerStartable.startup()
       kafkaServerStartable.awaitShutdown()

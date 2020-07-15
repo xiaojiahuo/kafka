@@ -16,18 +16,23 @@
  */
 package org.apache.kafka.connect.runtime;
 
+import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.config.ConfigTransformer;
 import org.apache.kafka.common.config.SaslConfigs;
+import org.apache.kafka.common.security.oauthbearer.internals.unsecured.OAuthBearerUnsecuredLoginCallbackHandler;
 import org.apache.kafka.connect.connector.ConnectRecord;
 import org.apache.kafka.connect.connector.Connector;
+import org.apache.kafka.connect.connector.policy.AllConnectorClientConfigOverridePolicy;
 import org.apache.kafka.connect.connector.policy.ConnectorClientConfigOverridePolicy;
 import org.apache.kafka.connect.connector.policy.NoneConnectorClientConfigOverridePolicy;
 import org.apache.kafka.connect.connector.policy.PrincipalConnectorClientConfigOverridePolicy;
 import org.apache.kafka.connect.runtime.distributed.ClusterConfigState;
 import org.apache.kafka.connect.runtime.isolation.PluginDesc;
 import org.apache.kafka.connect.runtime.isolation.Plugins;
+import org.apache.kafka.connect.runtime.rest.entities.ConfigInfo;
 import org.apache.kafka.connect.runtime.rest.entities.ConfigInfos;
 import org.apache.kafka.connect.runtime.rest.entities.ConnectorStateInfo;
 import org.apache.kafka.connect.runtime.rest.entities.ConnectorType;
@@ -37,6 +42,7 @@ import org.apache.kafka.connect.source.SourceTask;
 import org.apache.kafka.connect.storage.ConfigBackingStore;
 import org.apache.kafka.connect.storage.StatusBackingStore;
 import org.apache.kafka.connect.transforms.Transformation;
+import org.apache.kafka.connect.transforms.predicates.Predicate;
 import org.apache.kafka.connect.util.ConnectorTaskId;
 import org.easymock.Capture;
 import org.easymock.EasyMock;
@@ -56,7 +62,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
+import static org.apache.kafka.connect.runtime.AbstractHerder.keysWithVariableValues;
 import static org.powermock.api.easymock.PowerMock.verifyAll;
 import static org.powermock.api.easymock.PowerMock.replayAll;
 import static org.easymock.EasyMock.strictMock;
@@ -110,10 +119,10 @@ public class AbstractHerderTest {
         TASK_CONFIGS_MAP.put(TASK1, TASK_CONFIG);
         TASK_CONFIGS_MAP.put(TASK2, TASK_CONFIG);
     }
-    private static final ClusterConfigState SNAPSHOT = new ClusterConfigState(1, Collections.singletonMap(CONN1, 3),
+    private static final ClusterConfigState SNAPSHOT = new ClusterConfigState(1, null, Collections.singletonMap(CONN1, 3),
             Collections.singletonMap(CONN1, CONN1_CONFIG), Collections.singletonMap(CONN1, TargetState.STARTED),
             TASK_CONFIGS_MAP, Collections.<String>emptySet());
-    private static final ClusterConfigState SNAPSHOT_NO_TASKS = new ClusterConfigState(1, Collections.singletonMap(CONN1, 3),
+    private static final ClusterConfigState SNAPSHOT_NO_TASKS = new ClusterConfigState(1, null, Collections.singletonMap(CONN1, 3),
             Collections.singletonMap(CONN1, CONN1_CONFIG), Collections.singletonMap(CONN1, TargetState.STARTED),
             Collections.emptyMap(), Collections.<String>emptySet());
 
@@ -262,42 +271,46 @@ public class AbstractHerderTest {
 
 
     @Test(expected = BadRequestException.class)
-    public void testConfigValidationEmptyConfig() {
+    public void testConfigValidationEmptyConfig() throws Throwable {
         AbstractHerder herder = createConfigValidationHerder(TestSourceConnector.class, noneConnectorClientConfigOverridePolicy);
         replayAll();
 
-        herder.validateConnectorConfig(new HashMap<String, String>());
+        herder.validateConnectorConfig(Collections.emptyMap(), false);
 
         verifyAll();
     }
 
     @Test()
-    public void testConfigValidationMissingName() {
+    public void testConfigValidationMissingName() throws Throwable {
         AbstractHerder herder = createConfigValidationHerder(TestSourceConnector.class, noneConnectorClientConfigOverridePolicy);
         replayAll();
 
         Map<String, String> config = Collections.singletonMap(ConnectorConfig.CONNECTOR_CLASS_CONFIG, TestSourceConnector.class.getName());
-        ConfigInfos result = herder.validateConnectorConfig(config);
+        ConfigInfos result = herder.validateConnectorConfig(config, false);
 
         // We expect there to be errors due to the missing name and .... Note that these assertions depend heavily on
         // the config fields for SourceConnectorConfig, but we expect these to change rarely.
         assertEquals(TestSourceConnector.class.getName(), result.name());
-        assertEquals(Arrays.asList(ConnectorConfig.COMMON_GROUP, ConnectorConfig.TRANSFORMS_GROUP, ConnectorConfig.ERROR_GROUP), result.groups());
+        assertEquals(Arrays.asList(ConnectorConfig.COMMON_GROUP, ConnectorConfig.TRANSFORMS_GROUP,
+                ConnectorConfig.PREDICATES_GROUP, ConnectorConfig.ERROR_GROUP, SourceConnectorConfig.TOPIC_CREATION_GROUP), result.groups());
         assertEquals(2, result.errorCount());
-        // Base connector config has 13 fields, connector's configs add 2
-        assertEquals(15, result.values().size());
+        Map<String, ConfigInfo> infos = result.values().stream()
+                .collect(Collectors.toMap(info -> info.configKey().name(), Function.identity()));
+        // Base connector config has 14 fields, connector's configs add 2
+        assertEquals(17, infos.size());
         // Missing name should generate an error
-        assertEquals(ConnectorConfig.NAME_CONFIG, result.values().get(0).configValue().name());
-        assertEquals(1, result.values().get(0).configValue().errors().size());
+        assertEquals(ConnectorConfig.NAME_CONFIG,
+                infos.get(ConnectorConfig.NAME_CONFIG).configValue().name());
+        assertEquals(1, infos.get(ConnectorConfig.NAME_CONFIG).configValue().errors().size());
         // "required" config from connector should generate an error
-        assertEquals("required", result.values().get(13).configValue().name());
-        assertEquals(1, result.values().get(13).configValue().errors().size());
+        assertEquals("required", infos.get("required").configValue().name());
+        assertEquals(1, infos.get("required").configValue().errors().size());
 
         verifyAll();
     }
 
     @Test(expected = ConfigException.class)
-    public void testConfigValidationInvalidTopics() {
+    public void testConfigValidationInvalidTopics() throws Throwable {
         AbstractHerder herder = createConfigValidationHerder(TestSinkConnector.class, noneConnectorClientConfigOverridePolicy);
         replayAll();
 
@@ -306,13 +319,43 @@ public class AbstractHerderTest {
         config.put(SinkConnectorConfig.TOPICS_CONFIG, "topic1,topic2");
         config.put(SinkConnectorConfig.TOPICS_REGEX_CONFIG, "topic.*");
 
-        herder.validateConnectorConfig(config);
+        herder.validateConnectorConfig(config, false);
+
+        verifyAll();
+    }
+
+    @Test(expected = ConfigException.class)
+    public void testConfigValidationTopicsWithDlq() {
+        AbstractHerder herder = createConfigValidationHerder(TestSinkConnector.class, noneConnectorClientConfigOverridePolicy);
+        replayAll();
+
+        Map<String, String> config = new HashMap<>();
+        config.put(ConnectorConfig.CONNECTOR_CLASS_CONFIG, TestSinkConnector.class.getName());
+        config.put(SinkConnectorConfig.TOPICS_CONFIG, "topic1");
+        config.put(SinkConnectorConfig.DLQ_TOPIC_NAME_CONFIG, "topic1");
+
+        herder.validateConnectorConfig(config, false);
+
+        verifyAll();
+    }
+
+    @Test(expected = ConfigException.class)
+    public void testConfigValidationTopicsRegexWithDlq() {
+        AbstractHerder herder = createConfigValidationHerder(TestSinkConnector.class, noneConnectorClientConfigOverridePolicy);
+        replayAll();
+
+        Map<String, String> config = new HashMap<>();
+        config.put(ConnectorConfig.CONNECTOR_CLASS_CONFIG, TestSinkConnector.class.getName());
+        config.put(SinkConnectorConfig.TOPICS_REGEX_CONFIG, "topic.*");
+        config.put(SinkConnectorConfig.DLQ_TOPIC_NAME_CONFIG, "topic1");
+
+        herder.validateConnectorConfig(config, false);
 
         verifyAll();
     }
 
     @Test()
-    public void testConfigValidationTransformsExtendResults() {
+    public void testConfigValidationTransformsExtendResults() throws Throwable {
         AbstractHerder herder = createConfigValidationHerder(TestSourceConnector.class, noneConnectorClientConfigOverridePolicy);
 
         // 2 transform aliases defined -> 2 plugin lookups
@@ -330,7 +373,7 @@ public class AbstractHerderTest {
         config.put(ConnectorConfig.TRANSFORMS_CONFIG, "xformA,xformB");
         config.put(ConnectorConfig.TRANSFORMS_CONFIG + ".xformA.type", SampleTransformation.class.getName());
         config.put("required", "value"); // connector required config
-        ConfigInfos result = herder.validateConnectorConfig(config);
+        ConfigInfos result = herder.validateConnectorConfig(config, false);
         assertEquals(herder.connectorTypeForClass(config.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG)), ConnectorType.SOURCE);
 
         // We expect there to be errors due to the missing name and .... Note that these assertions depend heavily on
@@ -340,28 +383,42 @@ public class AbstractHerderTest {
         List<String> expectedGroups = Arrays.asList(
                 ConnectorConfig.COMMON_GROUP,
                 ConnectorConfig.TRANSFORMS_GROUP,
+                ConnectorConfig.PREDICATES_GROUP,
                 ConnectorConfig.ERROR_GROUP,
+                SourceConnectorConfig.TOPIC_CREATION_GROUP,
                 "Transforms: xformA",
                 "Transforms: xformB"
         );
         assertEquals(expectedGroups, result.groups());
         assertEquals(2, result.errorCount());
-        // Base connector config has 13 fields, connector's configs add 2, 2 type fields from the transforms, and
-        // 1 from the valid transformation's config
-        assertEquals(18, result.values().size());
+        Map<String, ConfigInfo> infos = result.values().stream()
+                .collect(Collectors.toMap(info -> info.configKey().name(), Function.identity()));
+        assertEquals(22, infos.size());
         // Should get 2 type fields from the transforms, first adds its own config since it has a valid class
-        assertEquals("transforms.xformA.type", result.values().get(13).configValue().name());
-        assertTrue(result.values().get(13).configValue().errors().isEmpty());
-        assertEquals("transforms.xformA.subconfig", result.values().get(14).configValue().name());
-        assertEquals("transforms.xformB.type", result.values().get(15).configValue().name());
-        assertFalse(result.values().get(15).configValue().errors().isEmpty());
+        assertEquals("transforms.xformA.type",
+                infos.get("transforms.xformA.type").configValue().name());
+        assertTrue(infos.get("transforms.xformA.type").configValue().errors().isEmpty());
+        assertEquals("transforms.xformA.subconfig",
+                infos.get("transforms.xformA.subconfig").configValue().name());
+        assertEquals("transforms.xformB.type", infos.get("transforms.xformB.type").configValue().name());
+        assertFalse(infos.get("transforms.xformB.type").configValue().errors().isEmpty());
 
         verifyAll();
     }
 
     @Test()
-    public void testConfigValidationPrincipalOnlyOverride() {
-        AbstractHerder herder = createConfigValidationHerder(TestSourceConnector.class, new PrincipalConnectorClientConfigOverridePolicy());
+    public void testConfigValidationPredicatesExtendResults() {
+        AbstractHerder herder = createConfigValidationHerder(TestSourceConnector.class, noneConnectorClientConfigOverridePolicy);
+
+        // 2 transform aliases defined -> 2 plugin lookups
+        Set<PluginDesc<Transformation>> transformations = new HashSet<>();
+        transformations.add(new PluginDesc<Transformation>(SampleTransformation.class, "1.0", classLoader));
+        EasyMock.expect(plugins.transformations()).andReturn(transformations).times(1);
+
+        Set<PluginDesc<Predicate>> predicates = new HashSet<>();
+        predicates.add(new PluginDesc<Predicate>(SamplePredicate.class, "1.0", classLoader));
+        EasyMock.expect(plugins.predicates()).andReturn(predicates).times(2);
+
         replayAll();
 
         // Define 2 transformations. One has a class defined and so can get embedded configs, the other is missing
@@ -369,13 +426,73 @@ public class AbstractHerderTest {
         Map<String, String> config = new HashMap<>();
         config.put(ConnectorConfig.CONNECTOR_CLASS_CONFIG, TestSourceConnector.class.getName());
         config.put(ConnectorConfig.NAME_CONFIG, "connector-name");
+        config.put(ConnectorConfig.TRANSFORMS_CONFIG, "xformA");
+        config.put(ConnectorConfig.TRANSFORMS_CONFIG + ".xformA.type", SampleTransformation.class.getName());
+        config.put(ConnectorConfig.TRANSFORMS_CONFIG + ".xformA.predicate", "predX");
+        config.put(ConnectorConfig.PREDICATES_CONFIG, "predX,predY");
+        config.put(ConnectorConfig.PREDICATES_CONFIG + ".predX.type", SamplePredicate.class.getName());
         config.put("required", "value"); // connector required config
-        String ackConfigKey = ConnectorConfig.CONNECTOR_CLIENT_PRODUCER_OVERRIDES_PREFIX + ProducerConfig.ACKS_CONFIG;
-        String saslConfigKey = ConnectorConfig.CONNECTOR_CLIENT_PRODUCER_OVERRIDES_PREFIX + SaslConfigs.SASL_JAAS_CONFIG;
+        ConfigInfos result = herder.validateConnectorConfig(config, false);
+        assertEquals(herder.connectorTypeForClass(config.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG)), ConnectorType.SOURCE);
+
+        // We expect there to be errors due to the missing name and .... Note that these assertions depend heavily on
+        // the config fields for SourceConnectorConfig, but we expect these to change rarely.
+        assertEquals(TestSourceConnector.class.getName(), result.name());
+        // Each transform also gets its own group
+        List<String> expectedGroups = Arrays.asList(
+                ConnectorConfig.COMMON_GROUP,
+                ConnectorConfig.TRANSFORMS_GROUP,
+                ConnectorConfig.PREDICATES_GROUP,
+                ConnectorConfig.ERROR_GROUP,
+                SourceConnectorConfig.TOPIC_CREATION_GROUP,
+                "Transforms: xformA",
+                "Predicates: predX",
+                "Predicates: predY"
+        );
+        assertEquals(expectedGroups, result.groups());
+        assertEquals(2, result.errorCount());
+        Map<String, ConfigInfo> infos = result.values().stream()
+                .collect(Collectors.toMap(info -> info.configKey().name(), Function.identity()));
+        assertEquals(24, infos.size());
+        // Should get 2 type fields from the transforms, first adds its own config since it has a valid class
+        assertEquals("transforms.xformA.type",
+                infos.get("transforms.xformA.type").configValue().name());
+        assertTrue(infos.get("transforms.xformA.type").configValue().errors().isEmpty());
+        assertEquals("transforms.xformA.subconfig",
+                infos.get("transforms.xformA.subconfig").configValue().name());
+        assertEquals("transforms.xformA.predicate",
+                infos.get("transforms.xformA.predicate").configValue().name());
+        assertTrue(infos.get("transforms.xformA.predicate").configValue().errors().isEmpty());
+        assertEquals("transforms.xformA.negate",
+                infos.get("transforms.xformA.negate").configValue().name());
+        assertTrue(infos.get("transforms.xformA.negate").configValue().errors().isEmpty());
+        assertEquals("predicates.predX.type",
+                infos.get("predicates.predX.type").configValue().name());
+        assertEquals("predicates.predX.predconfig",
+                infos.get("predicates.predX.predconfig").configValue().name());
+        assertEquals("predicates.predY.type",
+                infos.get("predicates.predY.type").configValue().name());
+        assertFalse(
+                infos.get("predicates.predY.type").configValue().errors().isEmpty());
+
+        verifyAll();
+    }
+
+    @Test()
+    public void testConfigValidationPrincipalOnlyOverride() throws Throwable {
+        AbstractHerder herder = createConfigValidationHerder(TestSourceConnector.class, new PrincipalConnectorClientConfigOverridePolicy());
+        replayAll();
+
+        Map<String, String> config = new HashMap<>();
+        config.put(ConnectorConfig.CONNECTOR_CLASS_CONFIG, TestSourceConnector.class.getName());
+        config.put(ConnectorConfig.NAME_CONFIG, "connector-name");
+        config.put("required", "value"); // connector required config
+        String ackConfigKey = producerOverrideKey(ProducerConfig.ACKS_CONFIG);
+        String saslConfigKey = producerOverrideKey(SaslConfigs.SASL_JAAS_CONFIG);
         config.put(ackConfigKey, "none");
         config.put(saslConfigKey, "jaas_config");
 
-        ConfigInfos result = herder.validateConnectorConfig(config);
+        ConfigInfos result = herder.validateConnectorConfig(config, false);
         assertEquals(herder.connectorTypeForClass(config.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG)), ConnectorType.SOURCE);
 
         // We expect there to be errors due to now allowed override policy for ACKS.... Note that these assertions depend heavily on
@@ -385,17 +502,68 @@ public class AbstractHerderTest {
         List<String> expectedGroups = Arrays.asList(
             ConnectorConfig.COMMON_GROUP,
             ConnectorConfig.TRANSFORMS_GROUP,
-            ConnectorConfig.ERROR_GROUP
+            ConnectorConfig.PREDICATES_GROUP,
+            ConnectorConfig.ERROR_GROUP,
+            SourceConnectorConfig.TOPIC_CREATION_GROUP
         );
         assertEquals(expectedGroups, result.groups());
         assertEquals(1, result.errorCount());
-        // Base connector config has 13 fields, connector's configs add 2, and 2 producer overrides
-        assertEquals(17, result.values().size());
+        // Base connector config has 14 fields, connector's configs add 2, and 2 producer overrides
+        assertEquals(19, result.values().size());
         assertTrue(result.values().stream().anyMatch(
             configInfo -> ackConfigKey.equals(configInfo.configValue().name()) && !configInfo.configValue().errors().isEmpty()));
         assertTrue(result.values().stream().anyMatch(
             configInfo -> saslConfigKey.equals(configInfo.configValue().name()) && configInfo.configValue().errors().isEmpty()));
 
+        verifyAll();
+    }
+
+    @Test
+    public void testConfigValidationAllOverride() throws Throwable {
+        AbstractHerder herder = createConfigValidationHerder(TestSourceConnector.class, new AllConnectorClientConfigOverridePolicy());
+        replayAll();
+
+        Map<String, String> config = new HashMap<>();
+        config.put(ConnectorConfig.CONNECTOR_CLASS_CONFIG, TestSourceConnector.class.getName());
+        config.put(ConnectorConfig.NAME_CONFIG, "connector-name");
+        config.put("required", "value"); // connector required config
+        // Try to test a variety of configuration types: string, int, long, boolean, list, class
+        String protocolConfigKey = producerOverrideKey(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG);
+        config.put(protocolConfigKey, "SASL_PLAINTEXT");
+        String maxRequestSizeConfigKey = producerOverrideKey(ProducerConfig.MAX_REQUEST_SIZE_CONFIG);
+        config.put(maxRequestSizeConfigKey, "420");
+        String maxBlockConfigKey = producerOverrideKey(ProducerConfig.MAX_BLOCK_MS_CONFIG);
+        config.put(maxBlockConfigKey, "28980");
+        String idempotenceConfigKey = producerOverrideKey(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG);
+        config.put(idempotenceConfigKey, "true");
+        String bootstrapServersConfigKey = producerOverrideKey(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG);
+        config.put(bootstrapServersConfigKey, "SASL_PLAINTEXT://localhost:12345,SASL_PLAINTEXT://localhost:23456");
+        String loginCallbackHandlerConfigKey = producerOverrideKey(SaslConfigs.SASL_LOGIN_CALLBACK_HANDLER_CLASS);
+        config.put(loginCallbackHandlerConfigKey, OAuthBearerUnsecuredLoginCallbackHandler.class.getName());
+
+        final Set<String> overriddenClientConfigs = new HashSet<>();
+        overriddenClientConfigs.add(protocolConfigKey);
+        overriddenClientConfigs.add(maxRequestSizeConfigKey);
+        overriddenClientConfigs.add(maxBlockConfigKey);
+        overriddenClientConfigs.add(idempotenceConfigKey);
+        overriddenClientConfigs.add(bootstrapServersConfigKey);
+        overriddenClientConfigs.add(loginCallbackHandlerConfigKey);
+
+        ConfigInfos result = herder.validateConnectorConfig(config, false);
+        assertEquals(herder.connectorTypeForClass(config.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG)), ConnectorType.SOURCE);
+
+        Map<String, String> validatedOverriddenClientConfigs = new HashMap<>();
+        for (ConfigInfo configInfo : result.values()) {
+            String configName = configInfo.configKey().name();
+            if (overriddenClientConfigs.contains(configName)) {
+                validatedOverriddenClientConfigs.put(configName, configInfo.configValue().value());
+            }
+        }
+        Map<String, String> rawOverriddenClientConfigs = config.entrySet().stream()
+            .filter(e -> overriddenClientConfigs.contains(e.getKey()))
+            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+        assertEquals(rawOverriddenClientConfigs, validatedOverriddenClientConfigs);
         verifyAll();
     }
 
@@ -422,6 +590,32 @@ public class AbstractHerderTest {
         assertFalse(reverseTransformed.get(0).containsKey(TEST_KEY3));
     }
 
+    @Test
+    public void testConfigProviderRegex() {
+        testConfigProviderRegex("\"${::}\"");
+        testConfigProviderRegex("${::}");
+        testConfigProviderRegex("\"${:/a:somevar}\"");
+        testConfigProviderRegex("\"${file::somevar}\"");
+        testConfigProviderRegex("${file:/a/b/c:}");
+        testConfigProviderRegex("${file:/tmp/somefile.txt:somevar}");
+        testConfigProviderRegex("\"${file:/tmp/somefile.txt:somevar}\"");
+        testConfigProviderRegex("plain.PlainLoginModule required username=\"${file:/tmp/somefile.txt:somevar}\"");
+        testConfigProviderRegex("plain.PlainLoginModule required username=${file:/tmp/somefile.txt:somevar}");
+        testConfigProviderRegex("plain.PlainLoginModule required username=${file:/tmp/somefile.txt:somevar} not null");
+        testConfigProviderRegex("plain.PlainLoginModule required username=${file:/tmp/somefile.txt:somevar} password=${file:/tmp/somefile.txt:othervar}");
+        testConfigProviderRegex("plain.PlainLoginModule required username", false);
+    }
+
+    private void testConfigProviderRegex(String rawConnConfig) {
+        testConfigProviderRegex(rawConnConfig, true);
+    }
+    
+    private void testConfigProviderRegex(String rawConnConfig, boolean expected) {
+        Set<String> keys = keysWithVariableValues(Collections.singletonMap("key", rawConnConfig), ConfigTransformer.DEFAULT_PATTERN);
+        boolean actual = keys != null && !keys.isEmpty() && keys.contains("key");
+        assertEquals(String.format("%s should have matched regex", rawConnConfig), expected, actual);
+    }
+
     private AbstractHerder createConfigValidationHerder(Class<? extends Connector> connectorClass,
                                                         ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy) {
 
@@ -444,8 +638,8 @@ public class AbstractHerderTest {
         EasyMock.expect(worker.getPlugins()).andStubReturn(plugins);
         final Connector connector;
         try {
-            connector = connectorClass.newInstance();
-        } catch (InstantiationException | IllegalAccessException e) {
+            connector = connectorClass.getConstructor().newInstance();
+        } catch (ReflectiveOperationException e) {
             throw new RuntimeException("Couldn't create connector", e);
         }
         EasyMock.expect(plugins.newConnector(connectorClass.getName())).andReturn(connector);
@@ -476,10 +670,38 @@ public class AbstractHerderTest {
         }
     }
 
+    public static class SamplePredicate<R extends ConnectRecord<R>> implements Predicate<R> {
+
+        @Override
+        public ConfigDef config() {
+            return new ConfigDef()
+                    .define("predconfig", ConfigDef.Type.STRING, "default", ConfigDef.Importance.LOW, "docs");
+        }
+
+        @Override
+        public boolean test(R record) {
+            return false;
+        }
+
+        @Override
+        public void close() {
+
+        }
+
+        @Override
+        public void configure(Map<String, ?> configs) {
+
+        }
+    }
+
     // We need to use a real class here due to some issue with mocking java.lang.Class
     private abstract class BogusSourceConnector extends SourceConnector {
     }
 
     private abstract class BogusSourceTask extends SourceTask {
+    }
+
+    private static String producerOverrideKey(String config) {
+        return ConnectorConfig.CONNECTOR_CLIENT_PRODUCER_OVERRIDES_PREFIX + config;
     }
 }
